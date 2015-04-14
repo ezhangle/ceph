@@ -3102,10 +3102,23 @@ uint32_t Objecter::list_nobjects_seek(NListContext *list_context,
   return list_context->current_pg;
 }
 
+/**
+ * Transform an object hash from its raw form to the nibble ordering
+ * used in HashIndex to store an ordered list.
+ */
+static uint32_t local_hash_to_osd_hash(uint32_t hash)
+{
+  hash = ((hash & 0x0f0f0f0f) << 4) | ((hash & 0xf0f0f0f0) >> 4);
+  hash = ((hash & 0x00ff00ff) << 8) | ((hash & 0xff00ff00) >> 8);
+  hash = ((hash & 0x0000ffff) << 16) | ((hash & 0xffff0000) >> 16);
+  return hash;
+}
+
+
 void Objecter::list_nobjects(NListContext *list_context, Context *onfinish)
 {
-  ldout(cct, 10) << "list_objects" << dendl;
-  ldout(cct, 20) << " pool_id " << list_context->pool_id
+  ldout(cct, 10) << __func__ << dendl;
+  ldout(cct, 10) << " pool_id " << list_context->pool_id
 	   << " pool_snap_seq " << list_context->pool_snap_seq
 	   << " max_entries " << list_context->max_entries
 	   << " list_context " << list_context
@@ -3113,16 +3126,65 @@ void Objecter::list_nobjects(NListContext *list_context, Context *onfinish)
 	   << " list_context->current_pg " << list_context->current_pg
 	   << " list_context->cookie " << list_context->cookie << dendl;
 
+  rwlock.get_read();
+  const pg_pool_t *pool = osdmap->get_pg_pool(list_context->pool_id);
+  uint32_t pg_num = pool->get_pg_num();
+  rwlock.unlock();
+
+  if (list_context->starting_pg_num == 0) {     // there can't be zero pgs!
+    list_context->starting_pg_num = pg_num;
+    ldout(cct, 20) << pg_num << " placement groups" << dendl;
+  }
+
+  // Are we operating over a split of the range, or the whole thing?
+  const bool range_split = list_context->worker_m > 0;
+
+  const uint32_t chunks_per_pg = list_context->worker_m;
+  const uint32_t chunks_per_worker = osdmap->get_pg_pool(list_context->pool_id)->get_pg_num();
+
+  uint32_t pg_min;
+  uint32_t pg_max;
+  if (range_split) {
+    pg_min = (list_context->worker_n * chunks_per_worker) / chunks_per_pg;
+    if (list_context->worker_n == list_context->worker_m - 1) {
+      // Extend PG max to encompass any remainder
+      pg_max = list_context->starting_pg_num - 1;
+    } else {
+      pg_max = (list_context->worker_n * chunks_per_worker + chunks_per_worker - 1) / chunks_per_pg;
+    }
+  } else {
+    pg_min = 0;
+    pg_max = list_context->starting_pg_num - 1;
+  }
+
+  ldout(cct, 10) << "Worker " << list_context->worker_n << "/" << list_context->worker_m
+    << " per-worker:" << chunks_per_worker << " per-pg:"
+    << chunks_per_pg << dendl;
+
+  ldout(cct, 10) << "Current PG " << list_context->current_pg << " min/max= "
+    << pg_min << "/" << pg_max << dendl;
+
+  if (range_split && list_context->object_hash_high == 0x0) {
+    // Initial call
+    list_context->current_pg = pg_min;
+    _nlist_recalc_limits(list_context);
+  }
+
   if (list_context->at_end_of_pg) {
     list_context->at_end_of_pg = false;
     ++list_context->current_pg;
     list_context->current_pg_epoch = 0;
     list_context->cookie = collection_list_handle_t();
-    if (list_context->current_pg >= list_context->starting_pg_num) {
+    
+    // Always list from upper
+    if (list_context->current_pg > pg_max) {
       list_context->at_end_of_pool = true;
       ldout(cct, 20) << " no more pgs; reached end of pool" << dendl;
     } else {
       ldout(cct, 20) << " move to next pg " << list_context->current_pg << dendl;
+      if (range_split) {
+        _nlist_recalc_limits(list_context);
+      }
     }
   }
   if (list_context->at_end_of_pool) {
@@ -3134,22 +3196,16 @@ void Objecter::list_nobjects(NListContext *list_context, Context *onfinish)
     return;
   }
 
-  rwlock.get_read();
-  const pg_pool_t *pool = osdmap->get_pg_pool(list_context->pool_id);
-  int pg_num = pool->get_pg_num();
-  rwlock.unlock();
-
-  if (list_context->starting_pg_num == 0) {     // there can't be zero pgs!
-    list_context->starting_pg_num = pg_num;
-    ldout(cct, 20) << pg_num << " placement groups" << dendl;
-  }
   if (list_context->starting_pg_num != pg_num) {
     // start reading from the beginning; the pgs have changed
     ldout(cct, 10) << " pg_num changed; restarting with " << pg_num << dendl;
-    list_context->current_pg = 0;
+    list_context->current_pg = pg_min;
     list_context->cookie = collection_list_handle_t();
     list_context->current_pg_epoch = 0;
     list_context->starting_pg_num = pg_num;
+    if (range_split) {
+      _nlist_recalc_limits(list_context);
+    }
   }
   assert(list_context->current_pg <= pg_num);
 
@@ -3164,10 +3220,143 @@ void Objecter::list_nobjects(NListContext *list_context, Context *onfinish)
 	  &list_context->bl, 0, onack, &onack->epoch, &list_context->ctx_budget);
 }
 
+void Objecter::_nlist_recalc_limits(NListContext *list_context)
+{
+  assert(list_context->current_pg < osdmap->get_pg_pool(list_context->pool_id)->get_pg_num());
+
+  // Count the bits in pg_num_mask
+  const uint32_t pg_num_mask = osdmap->get_pg_pool(list_context->pool_id)->get_pg_num_mask();
+  const uint32_t pg_num = osdmap->get_pg_pool(list_context->pool_id)->get_pg_num();
+  int pgnm_bits = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (((pg_num_mask) & (1 << i)) == 0) {
+      pgnm_bits = i;
+      break;
+    }
+  }
+
+  const uint32_t chunks_per_pg = list_context->worker_m;
+  const uint32_t chunks_per_worker = pg_num;
+
+  ldout(cct, 10) << "Upper bit mask: 0x" << std::hex << local_hash_to_osd_hash(pg_num_mask) << std::dec << dendl;
+
+  // Define a range that we will split up between the chunks in this
+  // PG.  The range has size 
+  uint32_t hash_range_size = 0xffffffff >> pgnm_bits;
+  uint32_t hash_split_size = (hash_range_size / chunks_per_pg);
+
+  uint32_t first_chunk = list_context->worker_n * chunks_per_worker;
+  uint32_t this_pg_base_chunk = chunks_per_pg * list_context->current_pg;
+
+  uint32_t last_chunk = list_context->worker_n * chunks_per_worker + chunks_per_worker - 1;
+  if (list_context->worker_n == list_context->worker_m - 1) {
+    last_chunk = chunks_per_worker * list_context->worker_m - 1;
+  }
+  uint32_t this_pg_last_chunk = chunks_per_pg * list_context->current_pg + chunks_per_pg - 1;
+  ldout(cct, 10) << "This PG has chunks " << this_pg_base_chunk << " thru "
+    << this_pg_last_chunk << dendl;
+
+  bool is_first_chunk_in_pg = false;
+  uint32_t hash_low_counter;
+  if (first_chunk <= this_pg_base_chunk) {
+    hash_low_counter = 0x0;
+    is_first_chunk_in_pg = true;
+  } else {
+    uint32_t this_pg_chunk_offset = first_chunk - this_pg_base_chunk;
+    hash_low_counter = this_pg_chunk_offset * hash_split_size;
+  }
+  ldout(cct, 10) << "This worker chunk range " << first_chunk << "-" << last_chunk << dendl;
+
+  bool is_last_chunk_in_pg = false;
+  uint32_t hash_high_counter;
+  if (last_chunk >= this_pg_last_chunk) {
+    hash_high_counter = hash_range_size; // Top of the PG
+    is_last_chunk_in_pg = true;
+  } else {
+    uint32_t this_pg_last_chunk = last_chunk - this_pg_base_chunk;
+    hash_high_counter = (this_pg_last_chunk + 1) * hash_split_size - 1;
+  }
+
+  uint32_t object_hash_mask = local_hash_to_osd_hash(pg_num_mask);
+
+  uint32_t pg_low_bits = local_hash_to_osd_hash(list_context->current_pg);
+  uint32_t pg_high_bits = local_hash_to_osd_hash(list_context->current_pg);
+  if (is_last_chunk_in_pg) {
+    /* Handle case where PG number is not a power of two: extend the upper
+     * limit to catch the guys who are assigned to this PG by ceph_stable_mod
+     * in the case where x & bmask >= b
+     *
+     * This will result in an uneven allocation of hash ranges between workers
+     * when a cluster has a non-power-of-two number of PGs, but it's the best
+     * we can do when assigning ranges.
+     */
+    pg_high_bits = local_hash_to_osd_hash(list_context->current_pg | 1 << (pgnm_bits - 1));
+  }
+
+  ldout(cct, 10) << "Mixing low: 0x" << std::hex << object_hash_mask
+    << " 0x" << pg_low_bits << " 0x" << hash_low_counter << std::dec << dendl;
+
+  ldout(cct, 10) << "Mixing high: 0x" << std::hex << object_hash_mask
+    << " 0x" << pg_low_bits << " 0x" << hash_high_counter << std::dec << dendl;
+
+  int k = 0; // Bit counter into the hash_low_counter
+
+  uint32_t hash_low = 0x0;
+  // Now substitute my counter bits into the zeros in the object hash
+  for (int i = 0; i < 32; ++i) {
+    uint32_t bit;
+    if (((object_hash_mask >> i) & 0x1) == 0) {
+      bit = (hash_low_counter >> k) & 0x1;
+      k++;
+    } else {
+      bit = (pg_low_bits >> i) & 0x1;
+    }
+
+    hash_low |= (bit << i);
+  }
+
+  k = 0;
+  uint32_t hash_high = 0x0;
+  // Now substitute my counter bits into the zeros in the object hash
+  for (int i = 0; i < 32; ++i) {
+    uint32_t bit;
+    if (((object_hash_mask >> i) & 0x1) == 0) {
+      bit = (hash_high_counter >> k) & 0x1;
+      k++;
+    } else {
+      bit = (pg_high_bits >> i) & 0x1;
+    }
+
+    hash_high |= (bit << i);
+  }
+
+
+
+  // Everything on this PG will have the same value for (unwtwiddled hash % pg_num_mask)
+  // so we don't care about the low pg_num_mask bits: the variation in hash values
+  // is all in the other bits
+  list_context->object_hash_low = hash_low;
+  list_context->object_hash_high = hash_high;
+  list_context->cookie.set_hash(local_hash_to_osd_hash(list_context->object_hash_low));
+
+  if (is_last_chunk_in_pg) {
+    uint32_t hash_high_2 = (0xffffffff & (~object_hash_mask)) | (pg_high_bits & object_hash_mask);
+    ldout(cct, 10) << "UPPER BOUND hash_high_2 = 0x" << std::hex << hash_high_2 << std::dec << dendl;
+    assert(hash_high == hash_high_2);
+  }
+  if (is_first_chunk_in_pg) {
+    uint32_t hash_low_2 = (0x00000000 & (~object_hash_mask)) | (pg_low_bits & object_hash_mask);
+    ldout(cct, 10) << "LOW BOUND hash_low_2 = 0x" << std::hex << hash_low_2 << std::dec << dendl;
+    assert(hash_low == hash_low_2);
+  }
+
+}
+
 void Objecter::_nlist_reply(NListContext *list_context, int r,
 			   Context *final_finish, epoch_t reply_epoch)
 {
-  ldout(cct, 10) << "_list_reply" << dendl;
+  ldout(cct, 10) << __func__ << dendl;
+  ldout(cct, 10) << __func__ << " cookie: " << list_context->cookie << dendl;
 
   bufferlist::iterator iter = list_context->bl.begin();
   pg_nls_response_t response;
@@ -3177,11 +3366,55 @@ void Objecter::_nlist_reply(NListContext *list_context, int r,
     ::decode(extra_info, iter);
   }
   list_context->cookie = response.handle;
+
+
   if (!list_context->current_pg_epoch) {
     // first pgls result, set epoch marker
     ldout(cct, 20) << " first pgls piece, reply_epoch is "
 		   << reply_epoch << dendl;
     list_context->current_pg_epoch = reply_epoch;
+  }
+
+  for (std::list<librados::ListObjectImpl>::iterator i = response.entries.begin();
+       i != response.entries.end(); ++i) {
+    std::string nspace = i->get_nspace();
+    std::string oid = i->get_oid();
+    std::string loc = i->get_locator();
+
+    int64_t hash_pos = get_object_hash_position(
+        list_context->pool_id, loc.empty() ? oid : loc, list_context->nspace); 
+
+    ldout(cct, 4) << std::hex << "0x" << hash_pos
+      << std::hex << " 0x" << local_hash_to_osd_hash(hash_pos)
+      << std::dec << ": " << oid << dendl;
+
+    // OSD should have respected our initial cookie, let's check
+    assert(local_hash_to_osd_hash(hash_pos) >= list_context->object_hash_low);
+    if (local_hash_to_osd_hash(hash_pos) < list_context->object_hash_low) {
+      lderr(cct) << "OSD returned unexpectedly low hash value 0x" << std::hex
+        << local_hash_to_osd_hash(hash_pos) << " vs low bound 0x"
+        << list_context->object_hash_low << std::dec << dendl;
+      final_finish->complete(-EIO);
+      return;
+    }
+
+    // Truncate entries at object_hash_high
+    if (list_context->worker_m && local_hash_to_osd_hash(hash_pos) > list_context->object_hash_high) {
+      ldout(cct, 10) << "Truncating (0x" << std::hex << local_hash_to_osd_hash(hash_pos) << " > 0x"
+                     << list_context->object_hash_high << std::dec << ")" << dendl;
+      response.entries.erase(i, response.entries.end());
+      r = 1;
+      break;
+    }
+  }
+
+  // The cookie points to the first object we would hit on a subsequent
+  // list op to this PG: if it's out of bounds, avoid issuing that op.
+  if (list_context->cookie.get_hash() > list_context->object_hash_high) {
+    ldout(cct, 10) << "Cookie (0x" << std::hex
+      << list_context->cookie.get_hash() << " > "
+      << list_context->object_hash_high << ", finished with this PG" << dendl;
+    r = 1;
   }
 
   int response_size = response.entries.size();
